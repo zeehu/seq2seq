@@ -3,7 +3,8 @@
 # @Project      : seq2seq
 # @FileName     : text_process.py
 # @Time         : Created at 2020-08-26
-
+import sys
+ 
 import numpy as np
 import os
 import torch
@@ -16,8 +17,8 @@ def get_pair_list(file):
     with open(file) as raw:
         for line in raw:
             li_sp = line.strip().split('\t')
-            in_list.append(li_sp[0].split(' '))
-            out_list.append(li_sp[1].split(' '))
+            in_list.append(li_sp[0].lower().split(' '))
+            out_list.append(li_sp[1].lower().split(' '))
     return in_list, out_list
 
 def get_word_list(file):
@@ -114,12 +115,23 @@ def word2idx(tokens, dictionary, add_eos=False):
     """transform word tokens to Tensor"""
     global i
     tensor = []
+    print(len(tokens))
+    n = 0
     for sent in tokens:
+        n += 1
+        t = 0
         sent_ten = []
         for i, word in enumerate(sent):
+            t += 1
             if word == cfg.pad_token:
                 break
-            sent_ten.append(dictionary[str(word)])
+            try:
+                sent_ten.append(dictionary[str(word)])
+            except:
+                print(sent)
+                print(n)
+                print(t)
+                continue
         if i >= cfg.max_seq_len - 1:
             #超长sentence 丢弃
             continue

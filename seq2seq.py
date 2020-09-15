@@ -1,6 +1,7 @@
 #coding: utf-8
 #Created Time: 2020-09-10 10:54:37
 
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -10,7 +11,7 @@ import config as cfg
 
 from instructor import BasicInstructor
 from model import Seq2Seq
-from text_process import idx2word
+from text_process import idx2word, word2idx
 
 class Seq2SeqInstructor(BasicInstructor):
     def __init__(self, opt):
@@ -23,6 +24,7 @@ class Seq2SeqInstructor(BasicInstructor):
         self.loss = nn.CrossEntropyLoss(reduction='none')
 
     def train(self, epoch, data_loader):
+        self.seq2seq.train()
         l_sum = 0.0
         for i, data in enumerate(data_loader):
             #输入,输出为文本; pad至相同长度
@@ -63,9 +65,26 @@ class Seq2SeqInstructor(BasicInstructor):
             self.optimizer.step()
             l_sum  += loss.data.item()
         if epoch % 1 == 0:
-            print("epoch %d, loss %.4f" % (epoch + 1, l_sum / len(data_loader)))
+            print("epoch %d, loss %.4f" % (epoch + 1, math.exp(l_sum / len(data_loader))))
+    
+    def test(self):
+        self.seq2seq.eval()
+        s1 = '微信 怎么 新建 群 聊'
+        s2 = '惠州 轻轨 时刻 表'
+        test_token = [s1.split(' '), s2.split(' ')]
+        test_tensor = word2idx(test_token, self.w2i_dict)
+        s_tensor = torch.full([len(test_tensor), 1],
+                self.w2i_dict[cfg.sos_token], dtype=torch.long)
+        if cfg.CUDA:
+            test_tensor = test_tensor.cuda()
+            s_tensor = s_tensor.cuda()
+        res = self.seq2seq.decode(test_tensor, s_tensor)
+        for r in res:
+            r_token = idx2word(r, self.i2w_dict)
+            for t in r_token:
+                print(" ".join(t))
 
     def _run(self):
         for epoch in range(self.opt.num_epochs):
             self.train(epoch, self.train_data.loader)
-            #self.test()
+            self.test()

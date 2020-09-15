@@ -5,8 +5,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import config as cfg
+
 import math
 import random
+from queue import PriorityQueue
+import operator
 
 class Encoder(nn.Module):
     def __init__(self, embedding, embed_dim, num_hiddens, num_layers, \
@@ -133,18 +137,19 @@ class Decoder(nn.Module):
 
         #c:[batch_size, 1, num_hidden]
         c = self.attention(enc_states, state[-1]) #取decoder最后一层隐藏状态做attention
+        #print("c:{}".format(c.size()))
         #inp:[batch_size, 1, embed_dim]
-        #print(cur_input)
+        #print("cur_input:{}".format(cur_input.size()))
         
         #inp:[batch_size, 1, vocab_size]
-        inp = self.embedding(cur_input).unsqueeze(1)
+        inp = self.embedding(cur_input)
         #print("inp:{}".format(inp.size()))
 
         #inp_and_c:[batch_size, 1, embed_dim+num_hidden]
         #输入rnn做转置 [1, b_s, e_d+n_h]
         inp_and_c = torch.cat((inp, c), dim=2).transpose(0, 1)
         #print("inp_and_c:{}".format(inp_and_c.size()))
-        output, state = self.rnn(inp_and_c, state)
+        output, state = self.rnn(inp_and_c.contiguous(), state.contiguous())
         #print("output:{}".format(output.size()))
         #print("state:{}".format(state.size()))
 
@@ -193,9 +198,147 @@ class Seq2Seq(nn.Module):
             #enc_outputs:[s_l, b_s, num_hidden]
             #dec_output:[batch_size, 1, vocab_size]
             #dec_states: -
+            dec_inputs = dec_inputs.unsqueeze(1)
+            #print("dec_inputs:{}".format(dec_inputs.size()))
             dec_output, dec_states = self.decoder(dec_inputs, dec_states,
                    enc_outputs)
             outputs[i] = dec_output
         #outputs:[batch_size, seq_len, vocab_size]
         outputs = outputs.permute(1, 0, 2)
         return outputs
+
+    def decode(self, src, tgt, method='beam-search'):
+        enc_outputs, enc_states = self.encoder(src)
+        dec_states = self.decoder.begin_state(enc_states)
+        #print("enc_outputs:{}".format(enc_outputs.size()))
+        #print("enc_states:{}".format(enc_states.size()))
+        if method == 'greedy-search':
+             return self.greedy_decode(tgt, dec_states, enc_outputs)
+        else:
+             return self.beam_decode(tgt, dec_states, enc_outputs)
+
+    def greedy_decode(self, tgt, dec_states, enc_outputs):
+        batch_size =tgt.size(0)
+        decoded_batch = torch.zeros(batch_size, cfg.max_seq_len)
+        dec_input = tgt
+        for t in range(cfg.max_seq_len):
+            #print("#######")
+            #print("dec_input:{}".format(dec_input.size()))
+            #print("dec_states:{}".format(dec_states.size()))
+            
+            dec_output, dec_states = self.decoder(dec_input, dec_states,
+                    enc_outputs)
+            #print("dec_output:{}".format(dec_output.size()))
+            #print("dec_states:{}".format(dec_states.size()))
+            topv, topi = dec_output.data.topk(1)
+            #print("topv:{}".format(topv.size()))
+            #print("topi:{}".format(topi.size()))
+            
+            topi = topi.view(-1)
+            #print("topi:{}".format(topi.size()))
+            decoded_batch[:, t] = topi
+
+            dec_input = topi.detach().view(-1)
+            dec_input = dec_input.unsqueeze(1)
+        #print("decoded_batch:{}".format(decoded_batch))
+        return decoded_batch
+
+    def beam_decode(self, tgt, dec_states, enc_outputs):
+        beam_width = 10
+        topk = 3
+        decoded_batch = []
+        #print("tgt:{}".format(tgt.size()))
+        #print("dec_states:{}".format(dec_states.size()))
+        #print("enc_outputs:{}".format(enc_outputs.size()))
+
+        #decode sentence by sentence
+        for idx in range(tgt.size(0)): #batch_szie
+            dec_state = dec_states[:, idx, :].unsqueeze(1)
+            enc_output = enc_outputs[:, idx, :].unsqueeze(1)
+
+            dec_input = tgt[idx].unsqueeze(1)
+            #print("dec_input:{}".format(dec_input.size()))
+            #print("dec_input:{}".format(dec_input))
+
+            #number of sentence to generate
+            endnodes = []
+            number_required = min((topk + 1), topk - len(endnodes))
+
+            #starting node - hidden state, previous node, word id, logp, length
+            node = BeamSearchNode(dec_state, None, dec_input, 0, 1)
+
+            nodes = PriorityQueue()
+
+            #star the queue
+            nodes.put((-node.eval(), node))
+            qsize = 1
+
+            #start beam search
+            while True:
+                if qsize > 200: break
+
+                score, n = nodes.get()
+                dec_input = n.wordid
+                dec_state = n.h
+
+                if n.wordid.item() == 2 and n.prevNode != None: #结束符 eos
+                    endnodes.append((score, n))
+                    if len(endnodes) >= number_required:
+                        break
+                    else:
+                        continue
+                #print("dec_input:{}".format(dec_input.size()))
+                #print("dec_state:{}".format(dec_state.size()))
+                #print("enc_output:{}".format(enc_output.size()))
+                dec_output, dec_state = self.decoder(dec_input, dec_state,
+                        enc_output)
+
+                log_prob, indexes = torch.topk(dec_output, beam_width)
+                nextnodes = []
+                for new_k in range(beam_width):
+                    decoded_t = indexes[0][0][new_k].view(-1).unsqueeze(1)
+                    log_p = log_prob[0][0][new_k].item()
+                    node = BeamSearchNode(dec_state, n, decoded_t, n.logp +
+                            log_p, n.leng + 1)
+                    score = -node.eval()
+                    nextnodes.append((score, node))
+
+                for i in range(len(nextnodes)):
+                    score, nn = nextnodes[i]
+                    nodes.put((score, nn))
+                qsize += len(nextnodes) - 1
+            #end beam search
+
+            if len(endnodes) == 0:
+                endnodes = [nodes.get() for _ in range(topk)]
+
+            utterances = []
+            for score, n in sorted(endnodes, key=operator.itemgetter(0)):
+                utterance = []
+                utterance.append(n.wordid.item())
+                while n.prevNode != None:
+                    n = n.prevNode
+                    utterance.append(n.wordid.item())
+                utterance = utterance[::-1]
+                utterances.append(torch.LongTensor(utterance))
+            decoded_batch.append(utterances)
+        return decoded_batch
+
+class BeamSearchNode(object):
+    def __init__(self, hidden_state, previousNode, wordId, logProb, length):
+        self.h = hidden_state
+        self.prevNode = previousNode
+        self.wordid = wordId
+        self.logp = logProb
+        self.leng = length
+
+    def eval(self, alpha=1.0):
+        reward = 0
+        #带有惩罚参数,参考吴恩达的beam-search
+        return self.logp / float(self.leng - 1 + 1e-6) + alpha * reward
+
+    def __lt__(self, other):
+        return self.leng < other.leng
+
+    def __gt__(self, other):
+        return self.leng > self.leng
